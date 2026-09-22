@@ -358,6 +358,57 @@ class CompareResponse(BaseModel):
     diffs: list[CompareDiff]
 
 
+# ---------------------------------------------------------------------------
+# 投递路径时钟审计（GET /messages/{id}/routing-audit，Received 头）
+# ---------------------------------------------------------------------------
+
+
+class RoutingHop(BaseModel):
+    """一个 Received 头重建出的投递跳（hop 顺序为自底向上/传输方向）。"""
+
+    index: int  # 自底向上 hop 序号，0 基（最早一跳为 0）
+    header_index: int  # 原始 Received 头物理顺序序号，0 基（最新一跳为 0）
+    host: Optional[str] = None  # by 主机规范化值（小写、剥地址括号/根点）
+    host_raw: Optional[str] = None  # by 后的原始 token
+    from_host: Optional[str] = None  # from 后的原始 token（缺失为 null）
+    protocol: Optional[str] = None  # with 协议（规范化小写，如 esmtps）
+    time: Optional[str] = None  # 头中时区的 ISO 8601 时间；不可解析为 null
+    time_raw: Optional[str] = None  # 最后一个 ';' 之后的原始 date-time 文本
+    raw: str  # 去折叠后的完整 Received 头值（诊断用）
+
+
+class RoutingAnomaly(BaseModel):
+    """一条投递路径异常（按 hop 顺序与类型固定优先级稳定排序）。
+
+    * ``unparseable_header``：缺 by 主机或缺/损坏 date-time，
+      ``detail.reasons`` 为 missing_by / missing_date / invalid_date；
+    * ``time_reversal``：相邻 hop 时间倒退，detail 给双方时间与负秒差；
+    * ``host_loop``：by 主机在更早 hop 已出现，detail 给首次位置。
+    """
+
+    type: str  # unparseable_header | time_reversal | host_loop
+    hop_index: int
+    header_index: int
+    detail: dict = {}
+
+
+class RoutingFirstAnomaly(BaseModel):
+    """首个异常的位置（hop 与原始头双重序号 + 类型）。"""
+
+    hop_index: int
+    header_index: int
+    type: str
+
+
+class RoutingAuditResponse(BaseModel):
+    id: int
+    fingerprint: str
+    hop_count: int
+    hops: list[RoutingHop]
+    anomalies: list[RoutingAnomaly]
+    first_anomaly: Optional[RoutingFirstAnomaly] = None
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

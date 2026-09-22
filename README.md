@@ -30,15 +30,16 @@ app/
   displaybody.py 展示正文选择（alternative/related/mixed 递归规则，纯只读）
   security.py    附件安全策略评估（双扩展/控制字符/禁止类型/嵌套/阈值，纯只读）
   delivery.py    投递状态报告解析（RFC 3464 DSN / RFC 6522 multipart/report，纯只读）
+  routingaudit.py 投递路径时钟审计（Received 头自底向上重建 hop、时间倒退/主机回环/坏头诊断，纯只读）
   threading.py   会话关联构建（Message-ID/References 回复图、断链、拓扑排序，纯只读）
   compare.py     两封邮件 MIME 树递归对齐比较（内容指纹配对、重排识别、歧义标记，纯只读）
   archive.py     整邮件附件 ZIP 打包（确定性条目/压缩、名称冲突改名、manifest.json，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     请求/响应模型
-tests/           327 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+tests/           359 个 pytest 用例（指纹稳定性、损坏输入、附件库、
                  整邮件 ZIP、cid 引用审计、展示正文选择、安全策略评估、
-                 DSN 投递状态、会话关联、MIME 树比较、HTTP 端到端）
+                 DSN 投递状态、投递路径时钟审计、会话关联、MIME 树比较、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -110,6 +111,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/display-body?prefer=html\|plain` | 选择客户端应展示的正文（见下） |
 | GET | `/messages/{id}/security-report` | 只读附件安全策略评估（见下，阈值可查询参数覆盖） |
 | GET | `/messages/{id}/delivery-report` | 解析 RFC 3464 投递状态报告（DSN，见下） |
+| GET | `/messages/{id}/routing-audit` | 从 `Received` 头重建投递路径并审计时钟倒退/回环/坏头（见下） |
 | GET | `/messages/{id}/thread` | 会话关联查询：回复图、断链与拓扑排序（见下） |
 | GET | `/messages/{id}/attachments.zip` | **整邮件附件 ZIP**：文档序逐 blob 出现打包 + 内置 manifest（见下） |
 | POST | `/messages/compare` | 只读比较两封已归档邮件的 MIME 树（见下） |
@@ -487,6 +489,127 @@ Notification，RFC 3464 / RFC 6522）。该接口是**纯只读查询**：只读
 | `INVALID_DELIVERY_STATUS` | 正文为空、缺少逐收件人块、字段行无冒号、块内字段重复、块首折叠续行 |
 | `MISSING_DELIVERY_FIELD` | 逐收件人块缺少非空 `Final-Recipient` / `Action` / `Status`（`detail.field`） |
 | `INVALID_DELIVERY_FIELD` | `Final-Recipient` 不是 `type; address`、`Action` 枚举非法或 `Status` 非三段数字（`detail.field` / `detail.value`） |
+
+## 投递路径时钟审计
+
+```bash
+curl http://localhost:8000/messages/1/routing-audit
+```
+
+在**根邮件**（path 为 `""` 的节点；`message/rfc822` 封装报文内部的
+`Received` 头不计）上，从全部 `Received` 头（RFC 5321 §4.4）重建投递
+路径并做确定性的时钟/路径审计。该接口是**纯只读查询**：只读取归档时
+保存的根节点头字段，不改写任何记录，对历史归档数据同样有效；重复请求
+结果稳定。
+
+**hop 重建**：邮件每经过一个 MTA，接收方就在报文**顶部**追加
+`Received` 头，因此物理顺序为最新在前、最旧在后。接口按邮件传输方向
+**自底向上**（物理顺序倒序）形成 hop 列表，每个 hop 给出：
+
+| 字段 | 含义 |
+| ---- | ---- |
+| `index` | 自底向上 hop 序号，0 基（最早一跳为 0，与传输方向一致） |
+| `header_index` | 原始 `Received` 头物理顺序序号，0 基（最新一跳为 0），与 `index` 互为倒序 |
+| `host` | `by` 接收主机的**规范化**值：小写、剥地址字面量方括号（`[10.0.0.1]` / `[IPv6:…]`）与 FQDN 末尾根点 |
+| `host_raw` | `by` 之后的原始 token |
+| `from_host` | `from` 之后的原始 token（该子句可选，缺失为 `null`） |
+| `protocol` | `with` 协议（规范化为小写，如 `esmtps`；缺失为 `null`） |
+| `time` | date-time 解析结果（ISO 8601，**保留头中声明的时区偏移**；无法解析为 `null`） |
+| `time_raw` | 最后一个 `;` 之后的原始 date-time 文本（缺失为 `null`） |
+| `raw` | 去折叠后的完整 `Received` 头值（归档口径，诊断用） |
+
+解析时先剥掉 RFC 5321 圆括号注释（`(Postfix)`、`(PDT)`、`([10.0.0.1])`
+等，支持嵌套与反斜杠转义），再以最后一个 `;` 切出 date-time；之前的
+部分按 `from` / `by` / `via` / `with` / `id` / `for` 关键字切子句。
+date-time 兼容 RFC 5322 数字时区（`+0530`）、命名时区
+（`GMT` / `EST` / `UTC` 等）与两位年份（obs-year 规则）；时间比较
+统一折算 UTC，响应展示仍用头中原始偏移。
+
+**异常检测**（`anomalies`，按 hop 顺序、同 hop 按类型固定优先级稳定
+排序；`first_anomaly` 给出首个异常的 `hop_index` / `header_index` /
+`type`，无异常为 `null`）：
+
+| `type` | 命中条件 | `detail` |
+| ---- | ---- | ---- |
+| `time_reversal` | **相邻**两个时间均可解析的 hop，后一 hop（更靠近接收端）时间早于前一 hop（相等不算）；时间不可解析的坏头不参与配对 | `previous`、`current`（各自原始偏移 ISO 时间）、`previous_index`、`delta_seconds`（负整数秒差） |
+| `host_loop` | 规范化 `by` 主机在**更早的 hop**（不必相邻）已出现 | `host`、`first_index`、`first_header_index`（首次出现位置） |
+| `unparseable_header` | 缺 `by` 主机（`missing_by`）、缺 date-time（`missing_date`）或 date-time 无法解析/日期不存在（`invalid_date`） | `reasons`（可多个）、`date_raw` |
+
+**坏头不拒收、不改写归档数据**：无法解析的 `Received` 头仍作为 hop
+保留在列表中（缺失字段为 `null`），同时列入 `anomalies` 诊断——接口
+始终返回 **200**，不会因坏头返回 422，归档的头值也保持原样。
+
+响应示例（三跳，最新一跳时间比上一跳早了 4 小时）：
+
+```json
+{
+  "id": 1,
+  "fingerprint": "4d460f48…ddf8",
+  "hop_count": 3,
+  "hops": [
+    {
+      "index": 0,
+      "header_index": 2,
+      "host": "msa.example.net",
+      "host_raw": "msa.example.net",
+      "from_host": "mail.example.com",
+      "protocol": "smtp",
+      "time": "2026-09-22T10:00:00-05:00",
+      "time_raw": "Mon, 22 Sep 2026 10:00:00 -0500",
+      "raw": "from mail.example.com (helo=foo) by msa.example.net with SMTP; Mon, 22 Sep 2026 10:00:00 -0500"
+    },
+    {
+      "index": 1,
+      "header_index": 1,
+      "host": "mx1.example.com",
+      "host_raw": "mx1.example.com",
+      "from_host": "msa.example.net",
+      "protocol": "esmtp",
+      "time": "2026-09-22T11:00:00-05:00",
+      "time_raw": "Mon, 22 Sep 2026 11:00:00 -0500",
+      "raw": "from msa.example.net by mx1.example.com with ESMTP id XYZ789; Mon, 22 Sep 2026 11:00:00 -0500"
+    },
+    {
+      "index": 2,
+      "header_index": 0,
+      "host": "mx2.example.com",
+      "host_raw": "mx2.example.com",
+      "from_host": null,
+      "protocol": "esmtps",
+      "time": "2026-09-22T12:00:00+00:00",
+      "time_raw": "Mon, 22 Sep 2026 12:00:00 +0000",
+      "raw": "by mx2.example.com with ESMTPS id ABC123; Mon, 22 Sep 2026 12:00:00 +0000"
+    }
+  ],
+  "anomalies": [
+    {
+      "type": "time_reversal",
+      "hop_index": 2,
+      "header_index": 0,
+      "detail": {
+        "previous": "2026-09-22T11:00:00-05:00",
+        "current": "2026-09-22T12:00:00+00:00",
+        "previous_index": 1,
+        "delta_seconds": -14400
+      }
+    }
+  ],
+  "first_anomaly": {
+    "hop_index": 2,
+    "header_index": 0,
+    "type": "time_reversal"
+  }
+}
+```
+
+异常情况：
+
+- 邮件不存在：**404**；
+- 邮件没有任何 `Received` 头（纯本地起草等）：**200**，`hop_count=0`、
+  `hops=[]`、`anomalies=[]`、`first_anomaly=null`；
+- 重复的 `Received` 头逐个保留（不去重），折叠头按归档时的去折叠结果
+  解析；封装在 `message/rfc822` / `message/global` 内部的 `Received`
+  头不属于根邮件，不计入审计。
 
 ## 会话关联查询
 
