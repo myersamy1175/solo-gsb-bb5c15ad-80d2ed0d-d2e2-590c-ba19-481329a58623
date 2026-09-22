@@ -27,6 +27,7 @@ from .displaybody import select_display_body
 from .errors import MIMEParseError
 from .mimeparser import fingerprint, parse_message, raw_sha256
 from .related import audit_related_resources
+from .routing import audit_routing
 from .threading import build_thread
 from .schemas import (
     AttachmentListResponse,
@@ -54,6 +55,11 @@ from .schemas import (
     RelatedReference,
     RelatedResourcesResponse,
     RelatedScope,
+    RoutingAnomaly,
+    RoutingAnomalyPosition,
+    RoutingAuditResponse,
+    RoutingDiagnostic,
+    RoutingHop,
     SecurityReportResponse,
     SecurityThresholds,
     SecurityTotals,
@@ -122,8 +128,12 @@ app = FastAPI(
         "出现分别打包（同哈希不合并），内置固定序列化的 manifest.json，"
         "条目时间/权限/压缩参数固定，重复下载字节一致并以归档 SHA-256 "
         "给出强 ETag；无附件返回仅含空 manifest 的有效 ZIP。"
+        "GET /messages/{id}/routing-audit 只读取根邮件 Received 头，"
+        "按物理序反转重建自底向上的投递路径，解析 from/by/with 主机与"
+        "协议、保留带时区原始时间，检测相邻 hop 时钟倒退、重复主机回环"
+        "与无法解析的头；坏头不改写归档数据，仅列入诊断。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -698,6 +708,90 @@ def get_delivery_report(
             )
             for r in reports
         ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 投递路径时钟审计（Received 头）
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/messages/{message_id}/routing-audit",
+    response_model=RoutingAuditResponse,
+)
+def get_routing_audit(
+    message_id: int,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> RoutingAuditResponse:
+    """审计根邮件 ``Received`` 头重建的投递路径（纯只读，不改写记录）。
+
+    取**根节点**（path 为 ``""``）的全部 ``Received`` 头（RFC 5322
+    §3.6.7；封装报文 ``message/rfc822`` 内部的头不属根路径）。中继
+    MTA 每跳把 ``Received`` 追加到信头顶端，因此信头物理序与投递方向
+    相反——响应按**自底向上**（最早一跳在前）给出 ``hops``，每个 hop
+    含 ``from`` / ``by`` 主机、``with`` 协议、带时区时间（保留 MTA
+    原始偏移，比较时换算 UTC）与双序号（``hop_index`` 投递序、
+    ``header_index`` 信头物理序）。
+
+    检测三类异常：``CLOCK_REGRESSION``（相邻 hop 后一跳 UTC 时刻早于
+    前一跳）、``HOST_LOOP``（接收主机规范化键与路径上更早 hop 重复）、
+    ``UNPARSEABLE_HEADER``（提取不到主机，或 ``;`` 后日期损坏）。坏头
+    不报错、不改写归档数据：hop 仍在，原文与原因进入 ``diagnostics``。
+    ``anomalies`` 稳定排序，``first_anomaly_at`` 给出首个异常位置。
+    邮件不存在返回 **404**；没有任何 Received 头返回空路径的 200。
+    """
+
+    msg = database.get_message(conn, message_id)
+    if msg is None:
+        raise _message_404(message_id)
+    rows = database.list_nodes(conn, message_id)
+    audit = audit_routing(rows)
+    return RoutingAuditResponse(
+        id=message_id,
+        fingerprint=msg["fingerprint"],
+        received_count=audit.received_count,
+        hops=[
+            RoutingHop(
+                hop_index=h.hop_index,
+                header_index=h.header_index,
+                from_host=h.from_host,
+                by_host=h.by_host,
+                host=h.host,
+                protocol=h.protocol,
+                timestamp=h.timestamp,
+                timestamp_raw=h.timestamp_raw,
+                bad=h.bad,
+            )
+            for h in audit.hops
+        ],
+        anomalies=[
+            RoutingAnomaly(
+                code=a.code,
+                hop_index=a.hop_index,
+                header_index=a.header_index,
+                detail=a.detail,
+            )
+            for a in audit.anomalies
+        ],
+        diagnostics=[
+            RoutingDiagnostic(
+                header_index=d.header_index,
+                hop_index=d.hop_index,
+                reasons=d.reasons,
+                raw=d.raw,
+            )
+            for d in audit.diagnostics
+        ],
+        first_anomaly_at=(
+            RoutingAnomalyPosition(
+                code=audit.first_anomaly.code,
+                hop_index=audit.first_anomaly.hop_index,
+                header_index=audit.first_anomaly.header_index,
+            )
+            if audit.first_anomaly is not None
+            else None
+        ),
     )
 
 

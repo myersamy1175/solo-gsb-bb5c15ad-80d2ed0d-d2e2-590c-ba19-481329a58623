@@ -31,14 +31,16 @@ app/
   security.py    附件安全策略评估（双扩展/控制字符/禁止类型/嵌套/阈值，纯只读）
   delivery.py    投递状态报告解析（RFC 3464 DSN / RFC 6522 multipart/report，纯只读）
   threading.py   会话关联构建（Message-ID/References 回复图、断链、拓扑排序，纯只读）
+  routing.py     投递路径时钟审计（Received 头 hop 重建、时钟倒退/主机回环/坏头诊断，纯只读）
   compare.py     两封邮件 MIME 树递归对齐比较（内容指纹配对、重排识别、歧义标记，纯只读）
   archive.py     整邮件附件 ZIP 打包（确定性条目/压缩、名称冲突改名、manifest.json，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     请求/响应模型
-tests/           327 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+tests/           359 个 pytest 用例（指纹稳定性、损坏输入、附件库、
                  整邮件 ZIP、cid 引用审计、展示正文选择、安全策略评估、
-                 DSN 投递状态、会话关联、MIME 树比较、HTTP 端到端）
+                 DSN 投递状态、会话关联、投递路径时钟审计、MIME 树比较、
+                 HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -111,6 +113,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/security-report` | 只读附件安全策略评估（见下，阈值可查询参数覆盖） |
 | GET | `/messages/{id}/delivery-report` | 解析 RFC 3464 投递状态报告（DSN，见下） |
 | GET | `/messages/{id}/thread` | 会话关联查询：回复图、断链与拓扑排序（见下） |
+| GET | `/messages/{id}/routing-audit` | 投递路径时钟审计：Received 头 hop 重建、时钟倒退/主机回环/坏头诊断（见下） |
 | GET | `/messages/{id}/attachments.zip` | **整邮件附件 ZIP**：文档序逐 blob 出现打包 + 内置 manifest（见下） |
 | POST | `/messages/compare` | 只读比较两封已归档邮件的 MIME 树（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
@@ -559,6 +562,134 @@ curl http://localhost:8000/messages/2/thread
 `null`）、原始与规范化主题、解析后的 `date`（非法/缺失时 `null`）、
 `parent_id` 与回复深度 `depth`（根为 0）；`edges` 是父子边
 （`parent_id` 是 `child_id` 的直接父件）。邮件不存在返回 **404**。
+
+## 投递路径时钟审计
+
+```bash
+curl http://localhost:8000/messages/1/routing-audit
+```
+
+在**根邮件**（MIME 树根节点）的 `Received` 头（RFC 5322 §3.6.7）上
+只读重建邮件的实际投递路径并检测时钟/路由异常。该接口是**纯只读
+查询**：只读取归档时保存的根节点头字段（`message/rfc822` 封装报文
+**内部**的 `Received` 头描述的是封装前的旅程，不属根路径，不参与
+审计），不改写任何归档记录，对历史归档数据同样有效；同一封邮件
+重复请求结果逐字节稳定。
+
+**Hop 重建**：中继 MTA 每接收一跳就把新的 `Received` 头**追加到信头
+顶端**，因此信头里的物理顺序（越靠上越晚）与投递方向相反。接口把
+物理顺序**反转**，按**自底向上**（最早接收的一跳在前）给出 `hops`，
+每个 hop 同时带两个稳定序号：
+
+- `hop_index` —— 投递序位置（0 基，0 = 最早一跳）；
+- `header_index` —— 该头在信头中的物理位置（0 基，自顶向下）。
+
+每个头解析出（圆括号注释如 `(Postfix)` / `(EST)` 在提取前剥离，
+折叠行在归档时已还原）：
+
+- `from_host` / `by_host` —— `from` / `by` 子句中的来源与接收主机
+  （**原始大小写**，IPv6 字面量保留方括号）；`host` 是用于回环比较的
+  规范化身份主机（**`by` 优先**——追加该头的 MTA，缺失时回退
+  `from`；规范化规则：小写、去尾点、剥 IP 字面方括号）；
+- `protocol` —— `with` 子句协议，小写（如 `esmtp` / `esmtps` /
+  `lmtp`），缺省为 `null`；
+- `timestamp` —— 头末最后一个 `;` 之后的 **RFC 5322 带时区日期**，
+  ISO 8601 输出并**保留 MTA 声明的原始偏移**（如
+  `2026-09-22T11:00:00+02:00`），时钟比较时统一换算 UTC；支持命名
+  时区（`GMT` / `EST` / `PDT` …）与小数秒；`timestamp_raw` 保留
+  原始日期串。老式**完全没有日期**的头合法：`timestamp` 为 `null`，
+  该 hop 保留在路径中但不参与时钟比较。
+
+**异常检测**（在投递序 hop 列表上进行，三类稳定 `code`）：
+
+| `code` | 命中条件 | `detail` |
+| ---- | ---- | ---- |
+| `CLOCK_REGRESSION` | **相邻两跳都有可解析时间**，后一跳 UTC 时刻**严格早于**前一跳（相等、跨时区但 UTC 相等均不误报；中间 hop 缺时间会断链，不跨空洞比较） | `previous_hop_index`、双方 ISO 时间与原始串、`seconds_delta`（负数秒） |
+| `HOST_LOOP` | 本跳身份主机的规范化键与路径上**更早的某一跳重复**（大小写/尾点/方括号不敏感），即邮件回到了已经过的主机 | `host`（规范化键）、`first_hop_index`（最早出现位置） |
+| `UNPARSEABLE_HEADER` | 头中既提取不到 `from`/`by` 任何主机（`NO_HOST`），或 `;` 后日期存在但无法解析/日历日不存在（`INVALID_DATE`，如 `30 Feb`、`25:00`、无法识别的时区） | `reasons`、`raw`（去折叠后的原始头值） |
+
+坏头**不返回错误、也不改写归档数据**：对应 hop 仍以 `bad: true`
+保留在 `hops` 中，坏头原文与原因同步列入 `diagnostics`
+（按物理头序），并作为 `UNPARSEABLE_HEADER` 进入 `anomalies`。
+`anomalies` 按 hop 序稳定排序，同一 hop 内固定顺序为
+`UNPARSEABLE_HEADER` → `CLOCK_REGRESSION` → `HOST_LOOP`；
+`first_anomaly_at` 给出首个异常的 `code` / `hop_index` /
+`header_index`，无异常时为 `null`。
+
+响应示例（三跳路径，第二跳时钟倒退且接收主机回环）：
+
+```json
+{
+  "id": 1,
+  "fingerprint": "ab041295…044fa",
+  "received_count": 3,
+  "hops": [
+    {
+      "hop_index": 0,
+      "header_index": 2,
+      "from_host": "mx3.example.org",
+      "by_host": "mx1.example.com",
+      "host": "mx1.example.com",
+      "protocol": "lmtp",
+      "timestamp": "2026-09-22T11:00:00+00:00",
+      "timestamp_raw": "Mon, 22 Sep 2026 11:00:00 +0000",
+      "bad": false
+    },
+    {
+      "hop_index": 1,
+      "header_index": 1,
+      "from_host": "mx2.example.net",
+      "by_host": "mx3.example.org",
+      "host": "mx3.example.org",
+      "protocol": "esmtps",
+      "timestamp": "2026-09-22T09:30:00+00:00",
+      "timestamp_raw": "Mon, 22 Sep 2026 09:30:00 +0000",
+      "bad": false
+    },
+    {
+      "hop_index": 2,
+      "header_index": 0,
+      "from_host": "mx1.example.com",
+      "by_host": "mx2.example.net",
+      "host": "mx2.example.net",
+      "protocol": "esmtp",
+      "timestamp": "2026-09-22T10:00:00+00:00",
+      "timestamp_raw": "Mon, 22 Sep 2026 10:00:00 +0000",
+      "bad": false
+    }
+  ],
+  "anomalies": [
+    {
+      "code": "CLOCK_REGRESSION",
+      "hop_index": 1,
+      "header_index": 1,
+      "detail": {
+        "previous_hop_index": 0,
+        "previous_timestamp": "2026-09-22T11:00:00+00:00",
+        "previous_timestamp_raw": "Mon, 22 Sep 2026 11:00:00 +0000",
+        "timestamp": "2026-09-22T09:30:00+00:00",
+        "timestamp_raw": "Mon, 22 Sep 2026 09:30:00 +0000",
+        "seconds_delta": -5400.0
+      }
+    }
+  ],
+  "diagnostics": [],
+  "first_anomaly_at": {
+    "code": "CLOCK_REGRESSION",
+    "hop_index": 1,
+    "header_index": 1
+  }
+}
+```
+
+异常情况：
+
+- 邮件不存在：**404**（与其他邮件级接口一致）；
+- 邮件没有任何 `Received` 头：**200**，`received_count` 为 0、
+  `hops` / `anomalies` / `diagnostics` 均为空、
+  `first_anomaly_at` 为 `null`；
+- 无法解析的 `Received` 头**不是 422**：路径、异常与诊断照常返回，
+  归档中的原始头值保持不变。
 
 ## 整邮件附件 ZIP
 

@@ -293,6 +293,61 @@ class DeliveryReportListResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 投递路径时钟审计（GET /messages/{id}/routing-audit）
+# ---------------------------------------------------------------------------
+
+
+class RoutingHop(BaseModel):
+    """投递序中的一跳（自底向上，最早一跳在前）。"""
+
+    hop_index: int  # 投递序位置（0 基）
+    header_index: int  # 该 Received 头在信头中的物理序（自顶向下，0 基）
+    from_host: Optional[str] = None  # from 子句主机（原始大小写）
+    by_host: Optional[str] = None  # by 子句主机（原始大小写）
+    host: Optional[str] = None  # 规范化身份主机（by 优先、回退 from）
+    protocol: Optional[str] = None  # with 子句协议（小写，如 esmtps）
+    timestamp: Optional[str] = None  # ISO 8601 带时区（保留 MTA 原始偏移）
+    timestamp_raw: Optional[str] = None  # ';' 后的原始日期串
+    bad: bool = False  # 该 Received 头无法完整解析（同时列入 diagnostics）
+
+
+class RoutingAnomaly(BaseModel):
+    """一条路径异常（``code`` 见路由模块）。"""
+
+    code: str  # UNPARSEABLE_HEADER | CLOCK_REGRESSION | HOST_LOOP
+    hop_index: int
+    header_index: int
+    detail: dict
+
+
+class RoutingAnomalyPosition(BaseModel):
+    """首个异常的位置（``anomalies`` 列表首项的定位）。"""
+
+    code: str
+    hop_index: int
+    header_index: int
+
+
+class RoutingDiagnostic(BaseModel):
+    """一个无法解析的 Received 头诊断（只读列出，不改写归档数据）。"""
+
+    header_index: int
+    hop_index: int
+    reasons: list[str]  # NO_HOST | INVALID_DATE
+    raw: str  # 去折叠后的原始头值
+
+
+class RoutingAuditResponse(BaseModel):
+    id: int
+    fingerprint: str
+    received_count: int  # 根邮件 Received 头总数
+    hops: list[RoutingHop]  # 自底向上的投递路径
+    anomalies: list[RoutingAnomaly]  # 按 hop 序稳定排序
+    diagnostics: list[RoutingDiagnostic]  # 坏头诊断（按物理头序）
+    first_anomaly_at: Optional[RoutingAnomalyPosition] = None
+
+
+# ---------------------------------------------------------------------------
 # 两封邮件 MIME 树比较（POST /messages/compare）
 # ---------------------------------------------------------------------------
 

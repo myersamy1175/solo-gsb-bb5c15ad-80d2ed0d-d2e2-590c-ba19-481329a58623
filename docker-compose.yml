@@ -3,9 +3,11 @@ services:
     build: .
     image: mime-fingerprint-api:latest
     ports:
+      # 宿主机 8000 -> 容器内 uvicorn 8000；接口总览见
+      # http://localhost:8000/docs，健康检查 GET /health
       - "8000:8000"
     environment:
-      # SQLite 数据库文件位置（容器内）；启动时自动建表
+      # SQLite 数据库文件位置（容器内）；启动时自动建表（幂等升级）
       MIME_DB_PATH: /data/mime.db
     volumes:
       - mime-data:/data
